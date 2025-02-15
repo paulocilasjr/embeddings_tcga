@@ -1,16 +1,16 @@
 import os
 import pandas as pd
 import numpy as np
-from sklearn.decomposition import PCA
-from PIL import Image
 import torch
+import torch.nn.functional as F
 from torchvision import models, transforms
-from sklearn.preprocessing import StandardScaler
+from PIL import Image
 
 # Constants
-OUTPUT_CSV = "image_embeddings_mil_14"
+OUTPUT_CSV = "image_embeddings_mil_15"
 IMG_SIZE = (224, 224)  # Image size for Ludwig
 EMBEDDING_SIZE = 1000  # Fixed size for all embeddings
+BAG_SIZE = 100  # Number of images per bag
 
 def load_dataset(dataset_type):
     if dataset_type == "all_data":
@@ -58,8 +58,11 @@ def extract_resnet_embedding(image_path, transform, resnet):
         embedding = np.pad(embedding, (0, EMBEDDING_SIZE - embedding.size), 'constant') if embedding.size < EMBEDDING_SIZE else embedding[:EMBEDDING_SIZE]
     return embedding
 
-def aggregate_embeddings(embeddings):
-    return np.max(embeddings, axis=0)
+def attention_pooling(embeddings):
+    embeddings_tensor = torch.tensor(embeddings, dtype=torch.float32)
+    attention_weights = F.softmax(embeddings_tensor @ embeddings_tensor.T, dim=1)  # Self-attention
+    pooled_embedding = attention_weights @ embeddings_tensor
+    return pooled_embedding.mean(dim=0).numpy()
 
 def convert_embedding_to_string(embedding):
     embedding = np.nan_to_num(embedding)
@@ -68,29 +71,32 @@ def convert_embedding_to_string(embedding):
 def create_bags(split_data, split, transform, resnet):
     print(f"Creating bags for split {split}", flush=True)
     bags = []
-
     sample_groups = split_data.groupby("sample")
-    print(sample_groups)
+
     for sample, group in sample_groups:
         embeddings = []
         labels = []
+        image_paths = group["image_path"].values
+        num_images = len(image_paths)
 
-        for _, row in group.iterrows():
-            embedding = extract_resnet_embedding(row["image_path"], transform, resnet)
+        for idx, image_path in enumerate(image_paths):
+            embedding = extract_resnet_embedding(image_path, transform, resnet)
             embeddings.append(embedding)
-            labels.append(row["er_status_by_ihc"])
-
-        if embeddings:
-            aggregated_embedding = aggregate_embeddings(np.array(embeddings))
-            embedding_string = convert_embedding_to_string(aggregated_embedding)
-            bag_label = int(any(np.array(labels) == 1))
-            bags.append({
-                "embedding": embedding_string,
-                "bag_label": bag_label,
-                "split": split,
-                "bag_size": len(embeddings),
-                "sample": sample
-            })
+            labels.append(group.iloc[idx]["er_status_by_ihc"])
+            
+            if len(embeddings) == BAG_SIZE or (idx == num_images - 1 and len(embeddings) > 0):
+                aggregated_embedding = attention_pooling(np.array(embeddings))
+                embedding_string = convert_embedding_to_string(aggregated_embedding)
+                bag_label = int(any(np.array(labels) == 1))
+                bags.append({
+                    "embedding": embedding_string,
+                    "bag_label": bag_label,
+                    "split": split,
+                    "bag_size": len(embeddings),
+                    "sample": sample
+                })
+                embeddings = []
+                labels = []
     return bags
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
